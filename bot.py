@@ -146,7 +146,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     lines = ["Доступные действия (инфинитив):"]
     lines += [f"• {inf}" for inf in INFINITIVES]
     lines.append("")
-    lines.append(f"Используйте бота инлайн: наберите в чате @{BOT_USERNAME} <действие>")
+    lines.append(f"Используйте бота инлайн: наберите в чате @{BOT_USERNAME} &lt;действие&gt;")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
