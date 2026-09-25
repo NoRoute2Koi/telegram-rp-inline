@@ -5,7 +5,7 @@ Flow:
 1. User writes @bot <action> in a chat.
 2. Bot returns one InlineQueryResultArticle:
    - title: "предложить <action> собеседника"
-   - message: "<first_name> хочет <action>"
+   - message: "<first_name> хочет <action>" (clickable names)
    - reply_markup: InlineKeyboard with "Принять"/"Отказ"
    - callback_data encodes action and initiator user_id.
 3. User clicks the article -> bot sends the message with buttons.
@@ -13,7 +13,12 @@ Flow:
 5. Bot edits the message to show result in past tense or refusal.
 """
 
+import html
+import re
+import sqlite3
 import tomllib
+from pathlib import Path
+
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -21,6 +26,7 @@ from telegram import (
     InputTextMessageContent,
     Update,
 )
+from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -37,8 +43,89 @@ with open("config.toml", "rb") as f:
     config = tomllib.load(f)
 
 BOT_TOKEN = config["BOT_TOKEN"]
+BOT_USERNAME = config.get("BOT_USERNAME", "your_bot_username")
 ACTIONS = config["actions"]  # dict: key -> [infinitive, past_form]
 INFINITIVES = [v[0] for v in ACTIONS.values()]
+
+
+# -----------------------------
+# Database (sqlite3)
+# -----------------------------
+DB_PATH = Path("bot.db")
+
+
+def init_db() -> None:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            custom_name TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            extra TEXT
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_custom_name(user_id: int) -> str | None:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT custom_name FROM users WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def set_custom_name(user_id: int, name: str) -> None:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+    if cur.fetchone():
+        cur.execute(
+            "UPDATE users SET custom_name = ? WHERE user_id = ?",
+            (name, user_id),
+        )
+    else:
+        cur.execute(
+            "INSERT INTO users (user_id, custom_name) VALUES (?, ?)",
+            (user_id, name),
+        )
+    conn.commit()
+    conn.close()
+
+
+async def get_display_name(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> str:
+    """Return clickable HTML link for user (custom name or first_name)."""
+    custom = get_custom_name(user_id)
+    if custom:
+        display = custom
+    else:
+        try:
+            chat = await context.bot.get_chat(user_id)
+            display = chat.first_name or str(user_id)
+        except Exception:
+            display = str(user_id)
+    safe = html.escape(display)
+    return f'<a href="tg://user?id={user_id}">{safe}</a>'
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+NAME_PATTERN = re.compile(r"^[A-Za-zА-Яа-яЁё\s]+$")
+
+
+def validate_name(name: str) -> bool:
+    name = name.strip()
+    if not name:
+        return False
+    if len(name) > 64:
+        return False
+    return bool(NAME_PATTERN.fullmatch(name))
 
 
 # -----------------------------
@@ -46,19 +133,55 @@ INFINITIVES = [v[0] for v in ACTIONS.values()]
 # -----------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /start command."""
-    await update.message.reply_text("test")
+    text = (
+        "Этот бот работает только в инлайн-режиме.\n"
+        f"Наберите в чате @{BOT_USERNAME} и действие, "
+        f"например: @{BOT_USERNAME} обнять"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /help command — list available actions from config."""
+    lines = ["Доступные действия (инфинитив):"]
+    lines += [f"• {inf}" for inf in INFINITIVES]
+    lines.append("")
+    lines.append(f"Используйте бота инлайн: наберите в чате @{BOT_USERNAME} <действие>")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def setname_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /setname <имя> — set custom display name (ru/en only)."""
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Использование: /setname <имя>\n"
+            "Имя может содержать только русские и английские буквы и пробелы.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    name = " ".join(args).strip()
+    if not validate_name(name):
+        await update.message.reply_text(
+            "Имя должно состоять только из русских и английских букв и пробелов (макс. 64 символа).",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    user_id = update.effective_user.id
+    set_custom_name(user_id, name)
+    await update.message.reply_text(
+        f"Имя установлено: {html.escape(name)}",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle inline queries.
+    """Handle inline queries."""
+    query_text = update.inline_query.query.strip().lower()
 
-    - empty query -> error card "пожалуйста, укажите действие"
-    - unknown action -> error card "неизвестное действие"
-    - known action -> one article with send-message and buttons.
-    """
-    query = update.inline_query.query.strip().lower()
-
-    if not query:
+    if not query_text:
         results = [
             InlineQueryResultArticle(
                 id="error_empty",
@@ -68,7 +191,7 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 ),
             )
         ]
-    elif query not in INFINITIVES:
+    elif query_text not in INFINITIVES:
         results = [
             InlineQueryResultArticle(
                 id="error_unknown",
@@ -79,19 +202,18 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
         ]
     else:
-        # Find infinitive and past form.
-        infinitive = query
+        infinitive = query_text
         past_form = None
         for key, (inf, past) in ACTIONS.items():
-            if inf == query:
+            if inf == query_text:
                 past_form = past
                 break
 
-        # Build message that will be sent when user clicks the article.
         from_user = update.inline_query.from_user
-        text = f"{from_user.first_name} хочет {infinitive}"
+        # Clickable initiator name
+        initiator_name = await get_display_name(context, from_user.id)
+        text = f"{initiator_name} хочет {infinitive}"
 
-        # Callback data: action:infinitive:from_user_id
         callback_data = f"{infinitive}:{from_user.id}"
 
         keyboard = [
@@ -107,10 +229,11 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         results = [
             InlineQueryResultArticle(
-                # unique per user+query to avoid cache reuse
                 id=f"{infinitive}:{from_user.id}",
                 title=f"предложить {infinitive} собеседника",
-                input_message_content=InputTextMessageContent(text),
+                input_message_content=InputTextMessageContent(
+                    text, parse_mode=ParseMode.HTML
+                ),
                 reply_markup=InlineKeyboardMarkup(keyboard),
             )
         ]
@@ -130,56 +253,47 @@ async def callback_query(
     query = update.callback_query
     await query.answer()
 
-    data = query.data  # format: "accept:<infinitive>:<user_id>" or "decline:<...>"
+    data = query.data
     try:
         prefix, payload = data.split(":", 1)
         infinitive, from_user_id_str = payload.split(":", 1)
         from_user_id = int(from_user_id_str)
     except ValueError:
-        await query.edit_message_text("ошибка: неверные данные кнопки")
+        await query.edit_message_text("ошибка: неверные данные кнопки", parse_mode=ParseMode.HTML)
         return
 
-    # Retrieve past form from config.
     past_form = None
     for key, (inf, past) in ACTIONS.items():
         if inf == infinitive:
             past_form = past
             break
     if past_form is None:
-        await query.edit_message_text("ошибка: неизвестное действие")
+        await query.edit_message_text("ошибка: неизвестное действие", parse_mode=ParseMode.HTML)
         return
 
     if prefix == "accept":
-        # Final message: "[initiator] past_form [presser]"
-        presser_name = query.from_user.first_name
-        text = f"{await _get_first_name(context, from_user_id)} {past_form} {presser_name}"
+        initiator_name = await get_display_name(context, from_user_id)
+        presser_name = await get_display_name(context, query.from_user.id)
+        text = f"{initiator_name} {past_form} {presser_name}"
     elif prefix == "decline":
-        # Final message: "предложение infinitive было отвергнуто"
         text = f"предложение {infinitive} было отвергнуто"
     else:
-        await query.edit_message_text("ошибка: неизвестное действие кнопки")
+        await query.edit_message_text("ошибка: неизвестное действие кнопки", parse_mode=ParseMode.HTML)
         return
 
-    # Edit the message to show final result and remove buttons.
-    await query.edit_message_text(text)
-
-
-async def _get_first_name(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> str:
-    """Fetch first name of a user by ID (may raise if bot hasn't seen user)."""
-    try:
-        chat = await context.bot.get_chat(user_id)
-        return chat.first_name or str(user_id)
-    except Exception:
-        return str(user_id)
+    await query.edit_message_text(text, parse_mode=ParseMode.HTML)
 
 
 # -----------------------------
 # Main
 # -----------------------------
 def main() -> None:
+    init_db()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("setname", setname_command))
     app.add_handler(InlineQueryHandler(inline_query))
     app.add_handler(CallbackQueryHandler(callback_query))
 
