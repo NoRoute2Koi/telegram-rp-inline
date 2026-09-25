@@ -107,14 +107,20 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         results = [
             InlineQueryResultArticle(
-                id=infinitive,  # unique id for this action
+                # unique per user+query to avoid cache reuse
+                id=f"{infinitive}:{from_user.id}",
                 title=f"предложить {infinitive} собеседника",
                 input_message_content=InputTextMessageContent(text),
                 reply_markup=InlineKeyboardMarkup(keyboard),
             )
         ]
 
-    await context.bot.answer_inline_query(update.inline_query.id, results)
+    await context.bot.answer_inline_query(
+        update.inline_query.id,
+        results,
+        cache_time=0,
+        is_personal=True,
+    )
 
 
 async def callback_query(
