@@ -155,7 +155,7 @@ async def setname_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     args = context.args
     if not args:
         await update.message.reply_text(
-            "Использование: /setname <имя>\n"
+            "Использование: /setname имя\n"
             "Имя может содержать только русские и английские буквы и пробелы.",
             parse_mode=ParseMode.HTML,
         )
